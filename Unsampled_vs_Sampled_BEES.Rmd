@@ -1,0 +1,928 @@
+CLEAN DATASET
+
+Load packages:
+
+```{r, message=FALSE}
+library(stringr)
+library(ggplot2)
+library(raster)
+library(dplyr)
+library(downloader) # for source_url()
+library(rgdal) #for readOGR()
+library(gdm) # for GDM analyses
+library(WhereNext)
+library(DHARMa)
+library(glmmTMB)
+```
+
+Load data:
+
+```{r}
+url <- "https://github.com/ibartomeus/IberianBees/raw/master/Data/iberian_bees.csv.gz"
+
+download.file(url = url,
+              destfile = "./Data/iberian_bees.csv.gz") # download date = 17/7/2022
+
+data <- read.csv(gzfile("./Data/iberian_bees.csv.gz"))
+
+# rename some columns so the dataset can be properly read by the clean_coordinates function in the CoordinateCleaner pacakge. Also, the former "species" column is actually the specific epithet of each species, not the species itself, which is "Accepted_name".
+
+data <- data %>% rename(
+  "species" = "Accepted_name",
+  "epithet" = "Species")
+
+rm(url)
+```
+
+# Data cleaning for GDM
+
+First, we need to clean the data.
+
+Remove species with no coordinates and fix coordinate precision problems.
+
+```{r}
+data <- data %>%
+  filter(!is.na(Latitude) | !is.na(Longitude) ) # remove records with no coordinates
+
+#some problems with coordinate precision:
+
+data$Coordinate.precision <- gsub("0,1 km", "100", data$Coordinate.precision) # 0,1 km is 100 m
+
+data$Coordinate.precision <- gsub("Km", "000", data$Coordinate.precision)
+
+data$Coordinate.precision <- gsub("km", "000", data$Coordinate.precision) # same with capital K
+
+data$Coordinate.precision <- gsub("~100 metres", "100", data$Coordinate.precision) # same with capital K
+
+data$Coordinate.precision <- gsub(" ", "", data$Coordinate.precision) # remove spaces
+
+data$Coordinate.precision <- gsub("<", "", data$Coordinate.precision) # remove < sign. This leaves us with an overestimate, which is good
+
+data$Coordinate.precision <- gsub("&lt;", "", data$Coordinate.precision) #remove "&lt;"
+
+data$Coordinate.precision <- gsub("m", "", data$Coordinate.precision) #remove m
+
+data$Coordinate.precision <- gsub("~", "", data$Coordinate.precision) #remove ~
+
+data$Coordinate.precision <- gsub("gps", NA, data$Coordinate.precision) #remove gps
+
+data$Coordinate.precision <- gsub("GPS; ", NA, data$Coordinate.precision) #remove "GPS; "
+
+data$Coordinate.precision <- gsub("GPS", NA, data$Coordinate.precision) #remove "GPS"
+
+data$Coordinate.precision <- gsub("uncert. < than 100km", NA, data$Coordinate.precision)
+
+data$Coordinate.precision <- gsub("uncert. < than 10km", NA, data$Coordinate.precision)
+
+data$Coordinate.precision <- gsub("uncert. < than 1km", NA, data$Coordinate.precision)
+
+data$Coordinate.precision <- gsub("uncert.than1000", NA, data$Coordinate.precision)
+
+data$Coordinate.precision <- gsub("uncert.than10000", NA, data$Coordinate.precision)
+
+
+data$Coordinate.precision <- as.numeric(data$Coordinate.precision) # turn into numeric
+
+
+data <- data %>%
+  filter(Coordinate.precision <= 10000 |
+           is.na(Coordinate.precision)) # Select coordinates with precision under 10 km or no precision recorded. We will assume that coordinates with no precision have errors lower than 10 km radius.
+
+# this is what we have:
+plot(data$Longitude, data$Latitude)
+```
+
+Clean coordinates with the *CoordinateCleaner* package.
+
+```{r}
+library(CoordinateCleaner)
+library(countrycode)
+
+# country names should be in iso3 format, not their English names. Transform:
+
+data$Country <-  countrycode(data$Country, origin =  'country.name', destination = 'iso3c')
+
+
+# clean coordinates:
+
+geo_flags <- clean_coordinates(x = data,
+                               lon = "Longitude",
+                               lat = "Latitude",
+                               species = "species",
+                               countries = "Country",
+                               tests = c("capitals",
+                                         "centroids",
+                                         "equal",
+                                         "institutions",
+                                         "seas", 
+                                         "zeros",
+                                         "countries"))
+
+# summary and plot of the problematic cases:
+summary(geo_flags)
+
+plot(geo_flags, lon = "Longitude", lat = "Latitude")
+
+# keep only good data:
+
+data <- data[which(geo_flags$.summary == "TRUE"),]
+rm(geo_flags)
+
+# Remove countries other than Spain and Portugal:
+data <- data %>%
+  filter(Country == "ESP" | Country == "PRT") # remove records with no coordinates
+
+# save clean dataset
+write.csv2(data, file = "Iberian_bees_clean.csv", row.names = FALSE)
+
+data <- read.csv("Iberian_bees_clean.csv", header = TRUE, sep = ";", dec = ",")
+
+# Remove the balearic islands:
+data <- data[-which(data$Province == "Balears, Illes"),]
+
+# also remove records prior than 1980, as our environmental data is 1980-2010
+
+data <- data %>%
+  filter(Year <= 1980) 
+```
+
+# Environmental data:
+
+Load country shapes:
+
+```{r eval=FALSE, include=FALSE}
+es <- getData("GADM", country="ES",level=0, path = "./Data/MAP")
+
+pt <- getData("GADM", country="PT",level=0, path = "./Data/MAP")
+
+iberia <- rbind(es, pt)
+
+#shapefile(iberia, file = "./MAP/Iberia")
+
+rm(es)
+rm(pt)
+```
+
+Remove Atlantic islands and other places not found in the Iberic mainland with any GIS software.
+
+Load layer again:
+
+```{r, warning=FALSE}
+setwd("./Data/MAP")
+iberia <- readOGR(dsn = ".", layer = "Iberian_peninsula")
+```
+
+Load environmental data and clip it with our map.
+Data can be downloaded from https://chelsa-climate.org/downloads/
+
+```{r}
+#setwd("../../")
+
+file.list <- list.files("./Data/CHELSA/CURRENT CLIMATE/2.5min/", pattern = "*.tif", full.names = TRUE)
+
+tif.read <- lapply(file.list, raster)
+
+stack.env <- stack(tif.read)
+
+crop.iberia <- crop(stack.env, iberia)
+iberia.env.pres <- mask(crop.iberia, iberia)
+
+rm(tif.read)
+rm(stack.env)
+rm(crop.iberia)
+rm(file.list)
+```
+
+Normalize environmental layers (to have a mean 0 and standard deviation 1):
+
+```{r}
+Normalize(iberia.env.pres)
+```
+
+Check colinearity between layers and remove those that are correlated with an R higher than 0.7:
+
+```{r}
+iberia.env.pres <- RemCorrLayers(iberia.env.pres, 0.7)
+```
+
+Estimate cell sampling stats & filter occurrence data
+
+```{r eval=FALSE, include=FALSE}
+# First let's fix abundance data and dates formatting.
+
+data$individualCount <- sum(data$Male, data$Female, data$Worker, data$Not.specified)
+
+data[is.na(data$individualCount),]$individualCount <- 1 # when the number of individuals is not recorded, use a one.
+
+# Create dates for when we have year, month and day complete data. Otherwise, use NA
+data$date <- ifelse(!is.na(data$Year) & !is.na(data$Month) & !is.na(data$Day), paste(data$Year, data$Month, data$Day, sep = "-"), NA)
+
+# If there is NA in Year, Month or Day but we have a date in "End.date", keep that, otherwise, keep the original date. 
+data$End.date <- gsub("/", "-", data$End.date) # formating
+data$End.date <- as.POSIXct(data$End.date, format = "%d-%m-%Y") # formating
+
+data$date <- ifelse(!is.na(data$End.date) & is.na(data$date), data$End.date, data$date)
+
+# Same with "Start.date"
+data$Start.date <- gsub("/", "-", data$Start.date)
+data$Start.date <- as.POSIXct(data$Start.date, format = "%d-%m-%Y")
+
+data$date <- ifelse(!is.na(data$Start.date) & is.na(data$date), data$Start.date, data$date)
+
+# Keep dates with month and year regardless of they missing day data, but only when there is no start or end date available
+data$date <- ifelse(!is.na(data$Year) & !is.na(data$Month) & is.na(data$Day) & is.na(data$date), paste(data$Year, data$Month, data$Day, sep = "-"), data$date)
+
+# Remove data with only year
+#data <- data[!is.na(data$date),]
+
+#OOOOR:
+
+# Keep dates with only year regardless of they missing month or day data, but only when there is no start or end date available
+#data$date <- ifelse(!is.na(data$Year) & is.na(data$Month) & is.na(data$Day) & is.na(data$date), data$Year, data$date)
+
+
+# Standardize date formats
+data$date <- gsub("/", "-", data$date)
+```
+
+# General biodiversity patterns and survey recommendations
+
+```{r}
+# Cell stats
+data$cell <- cellFromXY(iberia.env.pres, data[, c("Longitude","Latitude")])
+
+cell.stats.iberia <- RichSamp(data, iberia.env.pres, c("Longitude","Latitude","date","species","individualCount","cell"))
+
+#Consider places with at least 10 species recorded as well-sampled
+
+#selected.cells.iberia2 <- cell.stats.iberia$cell[which(cell.stats.iberia$n >= 3 & cell.stats.iberia$Species >= 5)]
+selected.cells.iberia <- cell.stats.iberia$cell[which(cell.stats.iberia$Species >= 10)]
+
+#data.sel.iberia2 <- data[which(data$cell %in% selected.cells.iberia2),]
+data.sel.iberia <- data[which(data$cell %in% selected.cells.iberia),]
+```
+
+Run and map GDM:
+
+```{r}
+m1 <- RunGDM(data.sel.iberia, iberia.env.pres, "bray", TRUE, TRUE, c("species", "Longitude", "Latitude"))
+
+summary(m1$gdm.res)
+
+# plot
+plotRGB(m1$gdm.map$pcaRast)
+
+#writeRaster(m1$gdm.map$pcaRast, "compositionPCA.TIFF", overwrite = TRUE)
+
+# Plot model fit:
+
+plot(m1$gdm.res, plot.color = "#2274A5", cex = 30, plot.layout=c(3,2))
+
+
+# Extract I-splines and plot them with axis labels
+gdm.1.splineDat <- isplineExtract(m1$gdm.res)
+
+par(mfrow = c(3,2))
+
+plot(gdm.1.splineDat$x[,"bio_1"],
+gdm.1.splineDat$y[,"bio_1"],
+lwd=3,
+type="l",
+col = "#2274A5",
+xlab="Annual Mean Temperature",
+ylab="Partial ecological distance")
+
+plot(gdm.1.splineDat$x[,"bio_3"],
+gdm.1.splineDat$y[,"bio_3"],
+lwd=3,
+type="l",
+col = "#2274A5",
+xlab="Isothermality",
+ylab="Partial ecological distance")
+
+plot(gdm.1.splineDat$x[,"bio_12"],
+gdm.1.splineDat$y[,"bio_12"],
+lwd=3,
+type="l",
+col = "#2274A5",
+xlab="Annual precipitation",
+ylab="Partial ecological distance")
+
+plot(gdm.1.splineDat$x[,"bio_15"],
+gdm.1.splineDat$y[,"bio_15"],
+lwd=3,
+type="l",
+col = "#2274A5",
+xlab="Precipitation seasonality",
+ylab="Partial ecological distance")
+
+# Geographical distance on its own
+
+plot(gdm.1.splineDat$x[,"Geographic"],
+gdm.1.splineDat$y[,"Geographic"],
+lwd=3,
+type="l",
+col = "#2274A5",
+xlab="Geographic distance",
+ylab="Partial ecological distance")
+```
+
+# Survey gap analysis:
+
+```{r}
+# Generate transformed predictor rasters, based on the raw raster predictor layers
+# and the fitted gdm
+transRasts <- gdm.transform(model=m1$gdm.res,
+data=iberia.env.pres)
+
+# put the values from the transformed layers in a table for easy analysis
+Trans.env.table <- as.matrix(transRasts)
+col.longs<-xFromCol(transRasts)
+row.lats<-yFromRow(transRasts)
+Cell_Long<-rep(col.longs, times=nrow(transRasts))
+Cell_Lat<-rep(row.lats, each=ncol(transRasts), times=1)
+Trans.env.table<-cbind(Cell_Long, Cell_Lat, Trans.env.table)
+Trans.env.table <- Trans.env.table[complete.cases(Trans.env.table),]
+# specify the locations used to fit the model
+ref.coords <- unique(cbind(data.sel.iberia$Longitude, data.sel.iberia$Latitude))
+# extract the gdm transformed predictor values for those locations
+ref.Trans.env.table <- extract(transRasts,ref.coords)
+ref.Trans.env.table <- ref.Trans.env.table[complete.cases(ref.Trans.env.table),]
+# Calculate the similarity of each grid cell to the survey cells
+# NB - This loop takes a couple of minutes
+mean.similarity.region <- rep(0, length=nrow(Trans.env.table))
+for(i.cell in 1:nrow(Trans.env.table)){
+# Check if this cell has data
+if(!is.na(Trans.env.table[i.cell,ncol(Trans.env.table)]))
+{
+# loop through the reference cells, calculate similarity, add it to the tally
+for(j.cell in 1:nrow(ref.Trans.env.table))
+{
+ecol.dist.1 <- sum(abs(Trans.env.table[i.cell,c(3:ncol(Trans.env.table))] -
+ref.Trans.env.table[j.cell,]))
+mean.similarity.region[i.cell] <- mean.similarity.region[i.cell] +
+(exp(-1 * (m1$gdm.res$intercept + ecol.dist.1)))
+} # end for j.cells
+# Finish by dividing by the number of neighbouring cells to get the mean
+mean.similarity.region[i.cell] <- mean.similarity.region[i.cell] / nrow(ref.Trans.env.table)
+} # end if(!is.na())
+} # end for i.cell
+
+# Format the similarities into a raster and plot them
+mnsim.ras <- raster(transRasts,layer=1)
+mnsim.ras <- rasterize(Trans.env.table[,c(1:2)],
+                       mnsim.ras,
+                       field=mean.similarity.region)
+
+raster:::.plotraster(mnsim.ras,
+                    col = heat.colors(100),
+                    zlim=c(0,0.3),
+                    legend.args = list(text = 'Similarity'))
+points(ref.coords)
+
+# Save raster
+
+#writeRaster(mnsim.ras, "SurveyGapAnalysis.TIFF", col = heat.colors(100), overwrite = TRUE)
+```
+
+# Survey recommendations:
+
+```{r}
+occ.table <- data.sel.iberia
+
+occ.table <- occ.table %>%
+  rename(
+    "decimalLatitude" = "Latitude",
+    "decimalLongitude" = "Longitude"
+  )
+
+names(m1$occ.table) <- c("species", "decimalLongitude", "decimalLatitude", "cell")
+
+init <- PreFindNext(m1$gdm.res, m1$occ.table, m1$gdm.rasters, subset.size=1000, search.type="1")
+
+plot(init$out.raster)
+points(init$selCoords)
+
+#Find additional survey suggestions
+
+update <- FindNext(init, "add")
+
+plot(update$out.raster)
+points(update$selCoords)
+
+update2 <- FindNext(update, "add")
+
+plot(update2$out.raster)
+points(update2$selCoords)
+
+update3 <- FindNext(update2, "add")
+
+plot(update3$out.raster)
+points(update3$selCoords)
+
+update4 <- FindNext(update3, "add")
+
+plot(update4$out.raster)
+points(update4$selCoords)
+
+update5 <- FindNext(update4, "add")
+
+plot(update5$out.raster)
+points(update5$selCoords)
+
+update6 <- FindNext(update5, "add")
+
+plot(update6$out.raster)
+points(update6$selCoords)
+
+update7 <- FindNext(update6, "add")
+
+plot(update7$out.raster)
+points(update7$selCoords)
+
+update8 <- FindNext(update7, "add")
+
+plot(update8$out.raster)
+points(update8$selCoords)
+
+update9 <- FindNext(update8, "add")
+
+plot(update9$out.raster)
+points(update9$selCoords)
+
+update10 <- FindNext(update9, "add")
+
+plot(update10$out.raster)
+points(update10$selCoords)
+
+update11 <- FindNext(update10, "add")
+
+update12 <- FindNext(update11, "add")
+
+update13 <- FindNext(update12, "add")
+
+update14 <- FindNext(update13, "add")
+
+update15 <- FindNext(update14, "add")
+
+
+
+# Plot all:
+#plotRGB(m1$gdm.map$pcaRast)
+
+raster:::.plotraster(mnsim.ras,
+                    col = heat.colors(100),
+                    zlim=c(0,0.3),
+                    legend.args = list(text = 'Similarity'))
+points(update$selCoords, pch = 19, col = "black")
+points(update2$selCoords, pch = 19, col = "black")
+points(update3$selCoords, pch = 19, col = "black")
+points(update4$selCoords, pch = 19, col = "black")
+points(update5$selCoords, pch = 19, col = "black")
+points(update6$selCoords, pch = 19, col = "black")
+points(update7$selCoords, pch = 19, col = "black")
+points(update8$selCoords, pch = 19, col = "black")
+points(update9$selCoords, pch = 19, col = "black")
+points(update10$selCoords, pch = 19, col = "black")
+points(update11$selCoords, pch = 19, col = "black")
+points(update12$selCoords, pch = 19, col = "black")
+points(update13$selCoords, pch = 19, col = "black")
+points(update14$selCoords, pch = 19, col = "black")
+points(update15$selCoords, pch = 19, col = "black")
+```
+
+# Future projection
+
+How big will be the changes provoked by climate change to these points in which sampling effort should increase?
+
+First load all future data.
+
+```{r}
+# 2010-2040 ssp126
+file.list <- list.files("./Data/CHELSA/FUTURE CLIMATE/2010-2040/ssp126/2.5min", pattern = "*.tif", full.names = TRUE)
+
+tif.read <- lapply(file.list, raster)
+
+future.20102040ssp126 <- stack(tif.read)
+
+crop.iberia.fut <- crop(future.20102040ssp126, iberia)
+iberia.fut.20102040ssp126 <- mask(crop.iberia.fut, iberia)
+
+Normalize(iberia.fut.20102040ssp126)
+
+
+# 2010-2040 ssp370
+file.list <- list.files("./Data/CHELSA/FUTURE CLIMATE/2010-2040/ssp370/2.5min", pattern = "*.tif", full.names = TRUE)
+
+tif.read <- lapply(file.list, raster)
+
+future.20102040ssp370 <- stack(tif.read)
+
+crop.iberia.fut <- crop(future.20102040ssp370, iberia)
+iberia.fut.20102040ssp370 <- mask(crop.iberia.fut, iberia)
+
+Normalize(iberia.fut.20102040ssp370)
+
+
+# 2010-2040 ssp585
+file.list <- list.files("./Data/CHELSA/FUTURE CLIMATE/2010-2040/ssp585/2.5min", pattern = "*.tif", full.names = TRUE)
+
+tif.read <- lapply(file.list, raster)
+
+future.20102040ssp585 <- stack(tif.read)
+
+crop.iberia.fut <- crop(future.20102040ssp585, iberia)
+iberia.fut.20102040ssp585 <- mask(crop.iberia.fut, iberia)
+
+Normalize(iberia.fut.20102040ssp585)
+
+
+# 2041-2070 ssp126
+file.list <- list.files("./Data/CHELSA/FUTURE CLIMATE/2041-2070/ssp126/2.5min", pattern = "*.tif", full.names = TRUE)
+
+tif.read <- lapply(file.list, raster)
+
+future.20412070ssp126 <- stack(tif.read)
+
+crop.iberia.fut <- crop(future.20412070ssp126, iberia)
+iberia.fut.20412070ssp126 <- mask(crop.iberia.fut, iberia)
+
+Normalize(iberia.fut.20412070ssp126)
+
+
+# 2041-2070 ssp370
+file.list <- list.files("./Data/CHELSA/FUTURE CLIMATE/2041-2070/ssp370/2.5min", pattern = "*.tif", full.names = TRUE)
+
+tif.read <- lapply(file.list, raster)
+
+future.20412070ssp370 <- stack(tif.read)
+
+crop.iberia.fut <- crop(future.20412070ssp370, iberia)
+iberia.fut.20412070ssp370 <- mask(crop.iberia.fut, iberia)
+
+Normalize(iberia.fut.20412070ssp370)
+
+
+# 2041-2070 ssp585
+file.list <- list.files("./Data/CHELSA/FUTURE CLIMATE/2041-2070/ssp585/2.5min", pattern = "*.tif", full.names = TRUE)
+
+tif.read <- lapply(file.list, raster)
+
+future.20412070ssp585 <- stack(tif.read)
+
+crop.iberia.fut <- crop(future.20412070ssp585, iberia)
+iberia.fut.20412070ssp585 <- mask(crop.iberia.fut, iberia)
+
+Normalize(iberia.fut.20412070ssp585)
+
+
+# 2071-2100 ssp126
+file.list <- list.files("./Data/CHELSA/FUTURE CLIMATE/2071-2100/ssp126/2.5min", pattern = "*.tif", full.names = TRUE)
+
+tif.read <- lapply(file.list, raster)
+
+future.20712100ssp126 <- stack(tif.read)
+
+crop.iberia.fut <- crop(future.20712100ssp126, iberia)
+iberia.fut.20712100ssp126 <- mask(crop.iberia.fut, iberia)
+
+Normalize(iberia.fut.20712100ssp126)
+
+
+# 2071-2100 ssp370
+file.list <- list.files("./Data/CHELSA/FUTURE CLIMATE/2071-2100/ssp370/2.5min", pattern = "*.tif", full.names = TRUE)
+
+tif.read <- lapply(file.list, raster)
+
+future.20712100ssp370 <- stack(tif.read)
+
+crop.iberia.fut <- crop(future.20712100ssp370, iberia)
+iberia.fut.20712100ssp370 <- mask(crop.iberia.fut, iberia)
+
+Normalize(iberia.fut.20712100ssp370)
+
+
+# 2071-2100 ssp585
+file.list <- list.files("./Data/CHELSA/FUTURE CLIMATE/2071-2100/ssp585/2.5min", pattern = "*.tif", full.names = TRUE)
+
+tif.read <- lapply(file.list, raster)
+
+future.20712100ssp585 <- stack(tif.read)
+
+crop.iberia.fut <- crop(future.20712100ssp585, iberia)
+iberia.fut.20712100ssp585 <- mask(crop.iberia.fut, iberia)
+
+Normalize(iberia.fut.20712100ssp585)
+
+rm(tif.read)
+rm(file.list)  
+```
+Project to future scenarios:
+
+```{r}
+# 2040
+
+iberia.env.pres.sel <- iberia.env.pres[[which(names(iberia.env.pres) %in% m1$gdm.res$predictors)]]
+
+iberia.fut.2040.126.sel <- iberia.fut.20102040ssp126[[which(names(iberia.fut.20102040ssp126) %in% m1$gdm.res$predictors)]]
+
+timePred.2040.126 <- predict(object=m1$gdm.res,
+data=iberia.env.pres.sel,
+time=T,
+predRasts=iberia.fut.2040.126.sel)
+
+plot(timePred.2040.126)
+
+iberia.fut.2040.370.sel <- iberia.fut.20102040ssp370[[which(names(iberia.fut.20102040ssp370) %in% m1$gdm.res$predictors)]]
+
+timePred.2040.370 <- predict(object=m1$gdm.res,
+data=iberia.env.pres.sel,
+time=T,
+predRasts=iberia.fut.2040.370.sel)
+
+plot(timePred.2040.370)
+
+iberia.fut.2040.585.sel <- iberia.fut.20102040ssp585[[which(names(iberia.fut.20102040ssp585) %in% m1$gdm.res$predictors)]]
+
+timePred.2040.585 <- predict(object=m1$gdm.res,
+data=iberia.env.pres.sel,
+time=T,
+predRasts=iberia.fut.2040.585.sel)
+
+plot(timePred.2040.585)
+
+# 2070
+
+iberia.fut.2070.126.sel <- iberia.fut.20412070ssp126[[which(names(iberia.fut.20412070ssp126) %in% m1$gdm.res$predictors)]]
+
+timePred2070.126 <- predict(object=m1$gdm.res,
+data=iberia.env.pres.sel,
+time=T,
+predRasts=iberia.fut.2070.126.sel)
+
+plot(timePred2070.126)
+
+iberia.fut.2070.370.sel <- iberia.fut.20412070ssp370[[which(names(iberia.fut.20412070ssp370) %in% m1$gdm.res$predictors)]]
+
+timePred2070.370 <- predict(object=m1$gdm.res,
+data=iberia.env.pres.sel,
+time=T,
+predRasts=iberia.fut.2070.370.sel)
+
+plot(timePred2070.370)
+
+iberia.fut.2070.585.sel <- iberia.fut.20412070ssp585[[which(names(iberia.fut.20412070ssp585) %in% m1$gdm.res$predictors)]]
+
+timePred2070.585 <- predict(object=m1$gdm.res,
+data=iberia.env.pres.sel,
+time=T,
+predRasts=iberia.fut.2070.585.sel)
+
+plot(timePred2070.585)
+
+# 2100
+
+iberia.fut.2100.126.sel <- iberia.fut.20712100ssp126[[which(names(iberia.fut.20712100ssp126) %in% m1$gdm.res$predictors)]]
+
+timePred2100.126 <- predict(object=m1$gdm.res,
+data=iberia.env.pres.sel,
+time=T,
+predRasts=iberia.fut.2100.126.sel)
+
+plot(timePred2100.126)
+
+iberia.fut.2100.370.sel <- iberia.fut.20712100ssp370[[which(names(iberia.fut.20712100ssp370) %in% m1$gdm.res$predictors)]]
+
+timePred2100.370 <- predict(object=m1$gdm.res,
+data=iberia.env.pres.sel,
+time=T,
+predRasts=iberia.fut.2100.370.sel)
+
+plot(timePred2100.370)
+
+iberia.fut.2100.585.sel <- iberia.fut.20712100ssp585[[which(names(iberia.fut.20712100ssp585) %in% m1$gdm.res$predictors)]]
+
+timePred2100.585 <- predict(object=m1$gdm.res,
+data=iberia.env.pres.sel,
+time=T,
+predRasts=iberia.fut.2100.585.sel)
+
+plot(timePred2100.585)
+
+
+
+
+
+
+
+raster:::.plotraster(timePred2100.126,
+                    col = rev(heat.colors(100)),
+                    zlim=c(0.7,1),
+                    legend.args = list(text = 'Turnover'))
+```
+
+Extract values from the survey recommendations:
+
+```{r}
+survey.recomm <- rbind(update$selCoords, update2$selCoords, update3$selCoords, update4$selCoords, update5$selCoords, update6$selCoords, update7$selCoords, update8$selCoords, update9$selCoords, update10$selCoords, update11$selCoords, update12$selCoords, update13$selCoords, update14$selCoords, update15$selCoords)
+
+survey2040126 <- raster::extract(timePred.2040.126, survey.recomm)
+
+survey2040370 <- raster::extract(timePred.2040.370, survey.recomm)
+
+survey2040585 <- raster::extract(timePred.2040.585, survey.recomm)
+
+survey2070126 <- raster::extract(timePred2070.126, survey.recomm)
+
+survey2070370 <- raster::extract(timePred2070.370, survey.recomm)
+
+survey2070585 <- raster::extract(timePred2070.585, survey.recomm)
+
+survey2100126 <- raster::extract(timePred2100.126, survey.recomm)
+
+survey2100370 <- raster::extract(timePred2100.370, survey.recomm)
+
+survey2100585 <- raster::extract(timePred2100.585, survey.recomm)
+
+
+# compare with our currently sampled grids:
+
+data.sel.iberia.coords <- data.frame(data.sel.iberia$Latitude, data.sel.iberia$Longitude, data.sel.iberia$cell)
+
+# Keep one coordinate per cell:
+
+data.sel.iberia.coords <- data.sel.iberia.coords %>% 
+  group_by(data.sel.iberia.cell) %>%
+  summarize(avg_latitude = mean(data.sel.iberia.Latitude),
+            avg_longitude = mean(data.sel.iberia.Longitude))
+
+names(data.sel.iberia.coords) <- c("cell", "y", "x")
+
+# extract:
+
+surveyed2040126 <- raster::extract(timePred.2040.126, data.sel.iberia.coords[,3:2])
+
+surveyed2040370 <- raster::extract(timePred.2040.370, data.sel.iberia.coords[,3:2])
+
+surveyed2040585 <- raster::extract(timePred.2040.585, data.sel.iberia.coords[,3:2])
+
+surveyed2070126 <- raster::extract(timePred2070.126, data.sel.iberia.coords[,3:2])
+
+surveyed2070370 <- raster::extract(timePred2070.370, data.sel.iberia.coords[,3:2])
+
+surveyed2070585 <- raster::extract(timePred2070.585, data.sel.iberia.coords[,3:2])
+
+surveyed2100126 <- raster::extract(timePred2100.126, data.sel.iberia.coords[,3:2])
+
+surveyed2100370 <- raster::extract(timePred2100.370, data.sel.iberia.coords[,3:2])
+
+surveyed2100585 <- raster::extract(timePred2100.585, data.sel.iberia.coords[,3:2])
+
+# merge sampled and unsampled cells
+survey2040126 <- data.frame(value = survey2040126, group = rep("recommendation",15))
+surveyed2040126 <- data.frame(value = surveyed2040126, group = rep("surveyed",15))
+
+fut.diff2040126 <- rbind(survey2040126, surveyed2040126)
+
+fut.diff2040126$year <- 2040
+fut.diff2040126$SSP <- 126
+fut.diff2040126$coord <- rbind(survey.recomm, data.sel.iberia.coords[,3:2])
+
+survey2040370 <- data.frame(value = survey2040370, group = rep("recommendation",15))
+surveyed2040370 <- data.frame(value = surveyed2040370, group = rep("surveyed",15))
+
+fut.diff2040370 <- rbind(survey2040370, surveyed2040370)
+
+fut.diff2040370$year <- 2040
+fut.diff2040370$SSP <- 370
+fut.diff2040370$coord <- rbind(survey.recomm, data.sel.iberia.coords[,3:2])
+
+survey2040585 <- data.frame(value = survey2040585, group = rep("recommendation",15))
+surveyed2040585 <- data.frame(value = surveyed2040585, group = rep("surveyed",15))
+
+fut.diff2040585 <- rbind(survey2040585, surveyed2040585)
+
+fut.diff2040585$year <- 2040
+fut.diff2040585$SSP <- 585
+fut.diff2040585$coord <- rbind(survey.recomm, data.sel.iberia.coords[,3:2])
+
+survey2070126 <- data.frame(value = survey2070126, group = rep("recommendation",15))
+surveyed2070126 <- data.frame(value = surveyed2070126, group = rep("surveyed",15))
+
+fut.diff2070126 <- rbind(survey2070126, surveyed2070126)
+
+fut.diff2070126$year <- 2070
+fut.diff2070126$SSP <- 126
+fut.diff2070126$coord <- rbind(survey.recomm, data.sel.iberia.coords[,3:2])
+
+survey2070370 <- data.frame(value = survey2070370, group = rep("recommendation",15))
+surveyed2070370 <- data.frame(value = surveyed2070370, group = rep("surveyed",15))
+
+fut.diff2070370 <- rbind(survey2070370, surveyed2070370)
+
+fut.diff2070370$year <- 2070
+fut.diff2070370$SSP <- 370
+fut.diff2070370$coord <- rbind(survey.recomm, data.sel.iberia.coords[,3:2])
+
+survey2070585 <- data.frame(value = survey2070585, group = rep("recommendation",15))
+surveyed2070585 <- data.frame(value = surveyed2070585, group = rep("surveyed",15))
+
+fut.diff2070585 <- rbind(survey2070585, surveyed2070585)
+
+fut.diff2070585$year <- 2070
+fut.diff2070585$SSP <- 585
+fut.diff2070585$coord <- rbind(survey.recomm, data.sel.iberia.coords[,3:2])
+
+survey2100126 <- data.frame(value = survey2100126, group = rep("recommendation",15))
+surveyed2100126 <- data.frame(value = surveyed2100126, group = rep("surveyed",15))
+
+fut.diff2100126 <- rbind(survey2100126, surveyed2100126)
+
+fut.diff2100126$year <- 2100
+fut.diff2100126$SSP <- 126
+fut.diff2100126$coord <- rbind(survey.recomm, data.sel.iberia.coords[,3:2])
+
+survey2100370 <- data.frame(value = survey2100370, group = rep("recommendation",15))
+surveyed2100370 <- data.frame(value = surveyed2100370, group = rep("surveyed",15))
+
+fut.diff2100370 <- rbind(survey2100370, surveyed2100370)
+
+fut.diff2100370$year <- 2100
+fut.diff2100370$SSP <- 370
+fut.diff2100370$coord <- rbind(survey.recomm, data.sel.iberia.coords[,3:2])
+
+survey2100585 <- data.frame(value = survey2100585, group = rep("recommendation",15))
+surveyed2100585 <- data.frame(value = surveyed2100585, group = rep("surveyed",15))
+
+fut.diff2100585 <- rbind(survey2100585, surveyed2100585)
+
+fut.diff2100585$year <- 2100
+fut.diff2100585$SSP <- 585
+fut.diff2100585$coord <- rbind(survey.recomm, data.sel.iberia.coords[,3:2])
+
+# merge all future scenarios
+
+all.data <- rbind(fut.diff2040126, fut.diff2040370, fut.diff2040585, fut.diff2070126, fut.diff2070370, fut.diff2070585, fut.diff2100126, fut.diff2100370, fut.diff2100585)
+
+all.data$year <- as.factor(all.data$year) #factorize
+all.data$SSP <- as.factor(all.data$SSP) #factorize
+
+all.data$site <- paste0(all.data$coord$x, all.data$coord$y, sep = "") # create a variable to use as random factor
+
+all.data$yearssp <- paste0(all.data$year, all.data$SSP, sep = "") # create a variable for each scenario (fut+ssp)
+
+
+# Run GLMM:
+
+# Transform biological change variable with arcsin(sqrt())
+
+all.data2 <- all.data # backup copy
+all.data2$value <- asin(sqrt(all.data2$value)) #transformation
+
+glmm <- glmmTMB(value ~ group*yearssp + (1|site), data = all.data2, family = Gamma(link=identity), na.action = "na.exclude")
+
+summary(glmm)
+
+AIC(glmm)
+sim_output <- simulateResiduals(fittedModel = glmm, plot = F) # simulate residuals
+plot(sim_output) # model evaluation
+
+glmmTMB:::Anova.glmmTMB(
+  glmm,
+  type = ("III"),
+  test.statistic = ("Chisq"),
+  component = "cond",
+  vconv. = vcov(glmm)[["cond"]]
+)
+
+# Save coordinates:
+write.csv(survey.recomm, "survey_recommendations.csv", quote = FALSE, row.names = FALSE)
+
+write.csv(ref.coords, "wellsampled_cells.csv", quote = FALSE, row.names = FALSE)
+
+
+library(ggplot2)
+
+ggplot(all.data) +
+ aes(x = value, y = SSP, fill = group) +
+ geom_boxplot() +
+ scale_fill_hue(direction = 1) +
+ theme_minimal() +
+ facet_wrap(vars(year))
+
+
+all.data2[all.data2$group == "recommendation",]$group <- "unsurveyed"
+
+ggplot(all.data2) +
+  aes(x = value, y = SSP, fill = group) +
+  geom_boxplot() +
+  scale_fill_manual(
+    values = c(unsurveyed = "#FF8600",
+    surveyed = "#005900")
+  ) +
+  labs(x = "Expected biological change") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  facet_wrap(vars(year)) +
+  coord_flip()
+```
